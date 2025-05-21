@@ -1,118 +1,167 @@
+import os
+import sys
 import cv2
 import mediapipe as mp
 import numpy as np
 import math
-from sklearn.svm import SVC
-from skimage.feature import hog
 
-
+# Initialize MediaPipe Hands solution
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
+hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
 
-def distance(pt1, pt2):
-    return math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
+# Display all files in the current directory to help user select an image
+print("Files in current directory:")
+for file in os.listdir():
+    print("-", file)
 
-def scale_image(img, scale):
-    h, w = img.shape[:2]
-    new_w, new_h = int(w * scale), int(h * scale)
-    if new_w <= 0 or new_h <= 0:
-        return img
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    if new_w > w or new_h > h:
-        x_crop = (new_w - w) // 2
-        y_crop = (new_h - h) // 2
-        cropped = resized[y_crop:y_crop + h, x_crop:x_crop + w]
-        return cropped
-    else:
-        canvas = np.zeros_like(img)
-        x_offset = (w - new_w) // 2
-        y_offset = (h - new_h) // 2
-        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
-        return canvas
-
-input_img = cv2.imread("image.jpeg")
-if input_img is None:
-    print("Error: Could not load image.jpeg")
+# Prompt user to enter the image filename
+image_name = input("Enter image filename (e.g., image.jpeg): ").strip()
+image = cv2.imread(image_name)
+if image is None:
+    print("❌ Error: Image not found.")
     exit()
 
+# Store original image dimensions
+img_h, img_w = image.shape[:2]
+
+# Initialize webcam
 cap = cv2.VideoCapture(0)
+ret, frame = cap.read()
+if not ret:
+    print("❌ Error: Cannot read from webcam.")
+    exit()
 
-svm = SVC(probability=True)
+cam_h, cam_w = frame.shape[:2]
 
-def extract_hog_features(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    features, hog_image = hog(gray, orientations=9, pixels_per_cell=(8,8),
-                              cells_per_block=(2,2), block_norm='L2-Hys',
-                              visualize=True, feature_vector=True)
-    return features
+# Set initial transformation values
+scale = 1.0
+angle = 0
+offset = np.array([(cam_w - img_w) // 2, (cam_h - img_h) // 2])  # Image centered
 
+# Track initial gesture state
+start_distance = None
+start_angle = None
+start_center = None
 
-prev_distance = None
-current_scale = 1.0
+# Setup for smoothing movements (Exponential Moving Average)
+SMOOTHING = 0.2
+smooth_scale = scale
+smooth_angle = angle
+smooth_offset = offset.copy()
 
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
+# Calculate Euclidean distance between two points
+def calc_distance(p1, p2):
+    return np.linalg.norm(np.array(p1) - np.array(p2))
+
+# Calculate angle (in degrees) between two points
+def calc_angle(p1, p2):
+    delta = np.array(p2) - np.array(p1)
+    return math.degrees(math.atan2(delta[1], delta[0]))
+
+# Main loop
+while True:
+    ret, frame = cap.read()
+    if not ret:
         break
+    frame = cv2.flip(frame, 1)  # Mirror the frame for intuitive control
+    cam_h, cam_w = frame.shape[:2]
 
-    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb)
 
-    blurred = cv2.GaussianBlur(frame, (5,5), 0)
+    # If a hand is detected and it is the right hand
+    if results.multi_hand_landmarks and results.multi_handedness:
+        handedness = results.multi_handedness[0].classification[0].label
+        if handedness == "Right":
+            hand = results.multi_hand_landmarks[0]
 
-    rgb = cv2.cvtColor(blurred, cv2.COLOR_BGR2RGB)
+            # Track landmarks: Thumb (4), Index (8), Wrist (0)
+            thumb = hand.landmark[4]
+            index = hand.landmark[8]
+            wrist = hand.landmark[0]
 
-    with mp_hands.Hands(
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7
-    ) as hands:
-        results = hands.process(rgb)
+            # Convert normalized coordinates to pixel coordinates
+            p_thumb = (int(thumb.x * cam_w), int(thumb.y * cam_h))
+            p_index = (int(index.x * cam_w), int(index.y * cam_h))
+            p_wrist = np.array([int(wrist.x * cam_w), int(wrist.y * cam_h)])
 
-    h, w, _ = frame.shape
-    gesture = None
+            # Current frame values
+            center_now = p_wrist
+            dist_now = calc_distance(p_thumb, p_index)
+            angle_now = calc_angle(p_thumb, p_index)
 
+            # Store initial frame values
+            if start_distance is None:
+                start_distance = dist_now
+                start_angle = angle_now
+                start_center = center_now
+            else:
+                # Calculate target transformations
+                target_scale = dist_now / start_distance
+                target_angle = angle_now - start_angle
+                target_offset = center_now - start_center + np.array([(cam_w - img_w) // 2, (cam_h - img_h) // 2])
+
+                # Apply smoothing
+                smooth_scale = (1 - SMOOTHING) * smooth_scale + SMOOTHING * target_scale
+                smooth_angle = (1 - SMOOTHING) * smooth_angle + SMOOTHING * target_angle
+                smooth_offset = (1 - SMOOTHING) * smooth_offset + SMOOTHING * target_offset
+        else:
+            # Reset if left hand is shown
+            start_distance = None
+            start_angle = None
+    else:
+        # Reset if no hand is detected
+        start_distance = None
+        start_angle = None
+
+    # Apply rotation and scaling to the image
+    M = cv2.getRotationMatrix2D((img_w // 2, img_h // 2), smooth_angle, smooth_scale)
+    transformed = cv2.warpAffine(image.copy(), M, (img_w, img_h))
+
+    # Create blank canvas and calculate overlay positions
+    canvas = np.zeros_like(frame)
+    x_off, y_off = smooth_offset.astype(int)
+    x1 = max(0, x_off)
+    y1 = max(0, y_off)
+    x2 = min(cam_w, x_off + img_w)
+    y2 = min(cam_h, y_off + img_h)
+
+    tx1 = max(0, -x_off)
+    ty1 = max(0, -y_off)
+    tx2 = tx1 + (x2 - x1)
+    ty2 = ty1 + (y2 - y1)
+
+    try:
+        # Place the transformed image onto the canvas
+        canvas[y1:y2, x1:x2] = transformed[ty1:ty2, tx1:tx2]
+    except:
+        pass  # Ignore edge-related exceptions
+
+    # Draw hand landmarks on the original frame
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
             mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-            lm = hand_landmarks.landmark
-            index_tip = (int(lm[8].x * w), int(lm[8].y * h))
-            thumb_tip = (int(lm[4].x * w), int(lm[4].y * h))
 
-            dist = distance(index_tip, thumb_tip)
-            x_min = min(int(lm[i].x * w) for i in range(21))
-            y_min = min(int(lm[i].y * h) for i in range(21))
-            x_max = max(int(lm[i].x * w) for i in range(21))
-            y_max = max(int(lm[i].y * h) for i in range(21))
-            roi = frame[y_min:y_max, x_min:x_max]
+    # Display original and canvas side by side
+    stacked = np.hstack((frame, canvas))
+    cv2.imshow("Right Hand Gesture Control | [Webcam | Transformed Image]", stacked)
 
-            if roi.size > 0:
-                features = extract_hog_features(roi)
-                if prev_distance is not None:
-                    diff = dist - prev_distance
-                    if diff > 10:
-                        gesture = "Zoom In"
-                        current_scale += 0.05
-                    elif diff < -10:
-                        gesture = "Zoom Out"
-                        current_scale -= 0.03
-                    current_scale = max(0.2, min(current_scale, 3.0))
-
-            prev_distance = dist
-    else:
-        prev_distance = None
-
-    transformed_img = scale_image(input_img, current_scale)
-    transformed_img = cv2.medianBlur(transformed_img, 3)
-
-    if gesture:
-        cv2.putText(frame, f"Gesture: {gesture}", (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-
-    cv2.imshow("Webcam Feed", frame)
-    cv2.imshow("Zoomed Image", transformed_img)
-
-    if cv2.waitKey(5) & 0xFF == 27:
+    # Exit or reset
+    key = cv2.waitKey(1)
+    if key == ord('q'):
         break
+    if key == ord('r'):
+        scale = 1.0
+        angle = 0
+        offset = np.array([(cam_w - img_w) // 2, (cam_h - img_h) // 2])
+        start_distance = None
+        start_angle = None
+        smooth_scale = scale
+        smooth_angle = angle
+        smooth_offset = offset.copy()
+        print("🔁 Transformations reset")
 
+# Release resources
 cap.release()
 cv2.destroyAllWindows()
